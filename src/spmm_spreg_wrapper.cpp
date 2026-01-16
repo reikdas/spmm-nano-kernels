@@ -4,6 +4,7 @@
 
 #include "spmm_spreg_wrapper.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 
@@ -12,6 +13,9 @@
 #include "Config.h"
 #include "mapping_io.h"
 #include "mapping_to_executor.h"
+
+// M_r for double precision AVX512 4x6 tile is 4
+static const int M_R = 4;
 
 // Use Intel kernel descriptor with load balancing for double precision
 // DataTransform=true means values are packed/transformed during inspection
@@ -24,6 +28,8 @@ struct SpregHandle {
     int M;
     int K;
     int N;
+    int M_padded;      // M rounded up to multiple of M_r (4)
+    double* internal_C; // Internal buffer for padded output (allocated if M != M_padded)
 };
 
 // Default configuration for single-threaded execution
@@ -75,11 +81,16 @@ void* spmm_spreg_init(
             num_threads,
             executor_id,
             mapping_id,
-            true  // allow_row_padding
+            true  // allow_row_padding - must be true for CAKE tiling, caller must provide padded C
         );
         
         // Allocate the executor for the given N (bcols)
         matmul->allocate_executor(N);
+        
+        // Compute padded M to match library's pad_to_multiple_of behavior
+        // The COO::pad_to_multiple_of always adds (M_R - M % M_R) rows,
+        // even when M is already a multiple of M_R. We must match this.
+        int M_padded = M + (M_R - M % M_R);
         
         // Create and return handle
         SpregHandle* handle = new SpregHandle();
@@ -87,6 +98,20 @@ void* spmm_spreg_init(
         handle->M = M;
         handle->K = K;
         handle->N = N;
+        handle->M_padded = M_padded;
+        
+        // Allocate internal buffer only if padding is needed
+        if (M_padded != M) {
+            handle->internal_C = static_cast<double*>(std::aligned_alloc(64, M_padded * N * sizeof(double)));
+            if (!handle->internal_C) {
+                std::cerr << "Failed to allocate internal_C buffer" << std::endl;
+                delete matmul;
+                delete handle;
+                return nullptr;
+            }
+        } else {
+            handle->internal_C = nullptr;
+        }
         
         return static_cast<void*>(handle);
         
@@ -108,17 +133,30 @@ void spmm_spreg_execute(
     
     SpregHandle* h = static_cast<SpregHandle*>(handle);
     
-    // Zero the output matrix
-    std::memset(C, 0, h->M * h->N * sizeof(double));
+    // Use internal buffer if padding is needed, otherwise use caller's buffer directly
+    double* C_exec = h->internal_C ? h->internal_C : C;
+    
+    // Zero the output matrix (padded size if using internal buffer)
+    int rows_to_zero = h->internal_C ? h->M_padded : h->M;
+    std::memset(C_exec, 0, rows_to_zero * h->N * sizeof(double));
     
     // Execute SpMM: C = A * B
-    (*h->matmul)(C, B);
+    (*h->matmul)(C_exec, B);
+    
+    // If using internal buffer, copy valid rows back to caller's buffer
+    if (h->internal_C) {
+        // Copy row by row since internal_C has different row stride
+        std::memcpy(C, h->internal_C, h->M * h->N * sizeof(double));
+    }
 }
 
 void spmm_spreg_cleanup(void* handle) {
     if (!handle) return;
     
     SpregHandle* h = static_cast<SpregHandle*>(handle);
+    if (h->internal_C) {
+        std::free(h->internal_C);
+    }
     delete h->matmul;
     delete h;
 }
